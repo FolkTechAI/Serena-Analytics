@@ -406,6 +406,114 @@ def crashes(range: str = "all", install_id: str = None):
     }
 
 
+@app.get("/api/funnel")
+def onboarding_funnel(range: str = "all"):
+    """Onboarding funnel — shows conversion at each stage from app launch to first message.
+    Each stage shows unique installs that reached it, plus drop-off from previous stage.
+    """
+    conn = get_db()
+    range_days = {"1d": 1, "7d": 7, "30d": 30, "all": 9999}.get(range, 9999)
+    since = (datetime.utcnow() - timedelta(days=range_days)).isoformat()
+
+    # Funnel stages in order
+    stages = [
+        ("app_launched", "App Launched"),
+        ("setup_started", "Setup Wizard Started"),
+        ("setup_completed", "Setup Completed"),
+        ("onboarding_started", "Onboarding Started"),
+        ("onboarding_completed", "Onboarding Completed"),
+        ("first_message_sent", "First Message Sent"),
+    ]
+
+    funnel = []
+    prev_count = None
+    for event_name, label in stages:
+        count = conn.execute(
+            "SELECT COUNT(DISTINCT install_id) FROM events WHERE event=? AND timestamp>=?",
+            (event_name, since)
+        ).fetchone()[0]
+        drop_off = None
+        conversion = None
+        if prev_count is not None and prev_count > 0:
+            drop_off = prev_count - count
+            conversion = round(count / prev_count, 3)
+        funnel.append({
+            "stage": event_name,
+            "label": label,
+            "unique_installs": count,
+            "drop_off": drop_off,
+            "conversion_from_previous": conversion,
+        })
+        prev_count = count
+
+    # Overall conversion: app_launched → first_message_sent
+    total_launched = funnel[0]["unique_installs"] if funnel else 0
+    total_completed = funnel[-1]["unique_installs"] if funnel else 0
+    overall_rate = round(total_completed / total_launched, 3) if total_launched > 0 else 0
+
+    # Setup step breakdown (which steps fail?)
+    step_rows = conn.execute(
+        "SELECT properties FROM events WHERE event='setup_step_completed' AND timestamp>=?",
+        (since,)
+    ).fetchall()
+    step_results = {}
+    for r in step_rows:
+        props = json.loads(r["properties"]) if r["properties"] else {}
+        step = props.get("step", "unknown")
+        success = props.get("success", True)
+        if step not in step_results:
+            step_results[step] = {"success": 0, "failed": 0}
+        step_results[step]["success" if success else "failed"] += 1
+
+    # Model download breakdown
+    dl_rows = conn.execute(
+        "SELECT properties FROM events WHERE event='setup_model_download' AND timestamp>=?",
+        (since,)
+    ).fetchall()
+    download_stats = {"started": 0, "completed": 0, "failed": 0, "already_exists": 0, "methods": {}}
+    for r in dl_rows:
+        props = json.loads(r["properties"]) if r["properties"] else {}
+        status = props.get("status", "unknown")
+        if status in download_stats:
+            download_stats[status] += 1
+        method = props.get("download_method")
+        if method:
+            download_stats["methods"][method] = download_stats["methods"].get(method, 0) + 1
+
+    # Onboarding page reach (which pages do people see?)
+    page_rows = conn.execute(
+        "SELECT properties FROM events WHERE event='onboarding_page_viewed' AND timestamp>=?",
+        (since,)
+    ).fetchall()
+    page_reach = {}
+    for r in page_rows:
+        props = json.loads(r["properties"]) if r["properties"] else {}
+        page = props.get("page", "unknown")
+        page_reach[page] = page_reach.get(page, 0) + 1
+
+    # Onboarding preferences (what do completers choose?)
+    pref_rows = conn.execute(
+        "SELECT properties FROM events WHERE event='onboarding_completed' AND timestamp>=?",
+        (since,)
+    ).fetchall()
+    pref_stats = {"voice_enabled": 0, "passcode_enabled": 0, "total": len(pref_rows)}
+    for r in pref_rows:
+        props = json.loads(r["properties"]) if r["properties"] else {}
+        if props.get("voice_enabled"): pref_stats["voice_enabled"] += 1
+        if props.get("passcode_enabled"): pref_stats["passcode_enabled"] += 1
+
+    conn.close()
+    return {
+        "range": range,
+        "funnel": funnel,
+        "overall_conversion": overall_rate,
+        "setup_steps": step_results,
+        "model_download": download_stats,
+        "onboarding_pages": page_reach,
+        "onboarding_preferences": pref_stats,
+    }
+
+
 @app.get("/api/events")
 def query_events(event: str, range: str = "7d", limit: int = 100):
     """Query raw events by type. Use for debugging any event category."""
@@ -660,6 +768,9 @@ def dashboard_html(range: str = "7d"):
     perf = data["performance"]
     tca = data["tca"]
 
+    # Get funnel data for this range
+    funnel_data = onboarding_funnel(range=range)
+
     tool_rows = "".join(
         f"<tr><td>{name}</td><td>{count}</td></tr>"
         for name, count in t["usage"].items()
@@ -669,6 +780,22 @@ def dashboard_html(range: str = "7d"):
         f"<tr><td>{v}</td><td>{c}</td></tr>"
         for v, c in data["versions"].items()
     ) or "<tr><td colspan='2'>No data yet</td></tr>"
+
+    # Build funnel rows
+    funnel_rows = ""
+    for stage in funnel_data["funnel"]:
+        conv_text = f"{stage['conversion_from_previous']*100:.0f}%" if stage['conversion_from_previous'] is not None else "-"
+        drop_text = str(stage['drop_off']) if stage['drop_off'] is not None else "-"
+        bar_width = 0
+        if funnel_data["funnel"][0]["unique_installs"] > 0:
+            bar_width = int(stage["unique_installs"] / funnel_data["funnel"][0]["unique_installs"] * 100)
+        funnel_rows += f"""<tr>
+            <td>{stage['label']}</td>
+            <td><div style="background:#1e40af;height:20px;width:{bar_width}%;border-radius:4px;min-width:2px"></div></td>
+            <td style="text-align:right;font-weight:700">{stage['unique_installs']}</td>
+            <td style="text-align:right;color:#94a3b8">{conv_text}</td>
+            <td style="text-align:right;color:#ef4444">{drop_text}</td>
+        </tr>"""
 
     html = f"""<!DOCTYPE html>
 <html><head>
@@ -719,6 +846,12 @@ def dashboard_html(range: str = "7d"):
   <div class="card"><div class="label">Tool Failures</div><div class="value">{perf['tool_failures']}</div></div>
   <div class="card"><div class="label">AppleScript Errors</div><div class="value">{perf['applescript_errors']}</div></div>
 </div>
+
+<div class="section"><h2>Onboarding Funnel (Overall: {funnel_data['overall_conversion']*100:.0f}%)</h2>
+<div class="card"><table>
+<tr><td style="color:#94a3b8;font-size:11px">STAGE</td><td style="color:#94a3b8;font-size:11px"></td><td style="color:#94a3b8;font-size:11px;text-align:right">INSTALLS</td><td style="color:#94a3b8;font-size:11px;text-align:right">CONV %</td><td style="color:#94a3b8;font-size:11px;text-align:right">DROP OFF</td></tr>
+{funnel_rows}
+</table></div></div>
 
 <div class="section"><h2>Tool Usage ({t['total_calls']} total)</h2>
 <div class="card"><table>{tool_rows}</table></div></div>
