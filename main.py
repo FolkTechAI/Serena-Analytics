@@ -49,8 +49,6 @@ def init_db():
     conn.execute("CREATE INDEX IF NOT EXISTS idx_event ON events(event)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_install_id ON events(install_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON events(timestamp)")
-    conn.commit()
-    conn.close()
 
     # Crash reports table — stores rich diagnostics from MetricKit + signal handlers
     conn.execute("""
