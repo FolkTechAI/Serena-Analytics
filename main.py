@@ -19,7 +19,7 @@ app = FastAPI(title="Serena Analytics", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -273,6 +273,80 @@ def health_report(range: str = "1d"):
         "affected_installs": affected,
         "recent_errors": recent,
     }
+
+
+@app.delete("/api/clear")
+def clear_events(event_type: str = None, before: str = None, install_id: str = None):
+    """Clear old events from the database.
+    - event_type: clear specific event type (e.g. 'crash_detected', 'tool_failed') or 'all' for everything
+    - before: clear events before this ISO date (e.g. '2026-02-15')
+    - install_id: clear only for a specific install
+    If no filters provided, returns error to prevent accidental wipe.
+    """
+    if not event_type and not before and not install_id:
+        raise HTTPException(status_code=400, detail="Provide at least one filter: event_type, before, or install_id. Use event_type=all&before=<date> to clear everything before a date.")
+
+    conn = get_db()
+    conditions = []
+    params = []
+
+    if event_type and event_type != "all":
+        conditions.append("event=?")
+        params.append(event_type)
+
+    if before:
+        conditions.append("timestamp<?")
+        params.append(before)
+
+    if install_id:
+        conditions.append("install_id=?")
+        params.append(install_id)
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+
+    # Count before delete
+    count = conn.execute(f"SELECT COUNT(*) FROM events WHERE {where}", params).fetchone()[0]
+
+    if count == 0:
+        conn.close()
+        return {"cleared": 0, "message": "No matching events found"}
+
+    conn.execute(f"DELETE FROM events WHERE {where}", params)
+    conn.commit()
+    conn.close()
+    return {"cleared": count, "filters": {"event_type": event_type, "before": before, "install_id": install_id}}
+
+
+@app.delete("/api/clear/crashes")
+def clear_crashes(before: str = None):
+    """Quick shortcut to clear all crash events, optionally before a date."""
+    conn = get_db()
+    if before:
+        count = conn.execute("SELECT COUNT(*) FROM events WHERE event='crash_detected' AND timestamp<?", (before,)).fetchone()[0]
+        conn.execute("DELETE FROM events WHERE event='crash_detected' AND timestamp<?", (before,))
+    else:
+        count = conn.execute("SELECT COUNT(*) FROM events WHERE event='crash_detected'").fetchone()[0]
+        conn.execute("DELETE FROM events WHERE event='crash_detected'")
+    conn.commit()
+    conn.close()
+    return {"cleared": count, "event_type": "crash_detected"}
+
+
+@app.delete("/api/clear/errors")
+def clear_all_errors(before: str = None):
+    """Clear all error-type events (crashes, tool failures, applescript errors)."""
+    error_types = ("crash_detected", "tool_failed", "applescript_error")
+    conn = get_db()
+    placeholders = ",".join(["?" for _ in error_types])
+    if before:
+        count = conn.execute(f"SELECT COUNT(*) FROM events WHERE event IN ({placeholders}) AND timestamp<?", (*error_types, before)).fetchone()[0]
+        conn.execute(f"DELETE FROM events WHERE event IN ({placeholders}) AND timestamp<?", (*error_types, before))
+    else:
+        count = conn.execute(f"SELECT COUNT(*) FROM events WHERE event IN ({placeholders})", error_types).fetchone()[0]
+        conn.execute(f"DELETE FROM events WHERE event IN ({placeholders})", error_types)
+    conn.commit()
+    conn.close()
+    return {"cleared": count, "event_types": list(error_types)}
 
 
 @app.get("/api/crashes")
