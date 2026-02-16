@@ -106,6 +106,102 @@ async def receive_events(request: Request):
     conn.close()
     return {"received": inserted}
 
+@app.get("/api/crashes")
+def crashes(range: str = "all", install_id: str = None):
+    """Return detailed crash events with full properties."""
+    conn = get_db()
+    range_days = {"1d": 1, "7d": 7, "30d": 30, "all": 9999}.get(range, 9999)
+    since = (datetime.utcnow() - timedelta(days=range_days)).isoformat()
+
+    if install_id:
+        rows = conn.execute(
+            "SELECT * FROM events WHERE event='crash_detected' AND timestamp>=? AND install_id=? ORDER BY timestamp DESC",
+            (since, install_id)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM events WHERE event='crash_detected' AND timestamp>=? ORDER BY timestamp DESC",
+            (since,)
+        ).fetchall()
+
+    crashes = []
+    for r in rows:
+        props = json.loads(r["properties"]) if r["properties"] else {}
+        crashes.append({
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "install_id": r["install_id"],
+            "app_version": r["app_version"],
+            "received_at": r["received_at"],
+            "error": props.get("error", "unknown"),
+            "stack_trace": props.get("stack_trace", None),
+            "context": props.get("context", None),
+            "view": props.get("view", None),
+            "properties": props,
+        })
+
+    # Summary by error type
+    error_counts = {}
+    for c in crashes:
+        err = c["error"]
+        error_counts[err] = error_counts.get(err, 0) + 1
+    error_counts = dict(sorted(error_counts.items(), key=lambda x: x[1], reverse=True))
+
+    # Summary by install
+    install_counts = {}
+    for c in crashes:
+        iid = c["install_id"]
+        install_counts[iid] = install_counts.get(iid, 0) + 1
+
+    conn.close()
+    return {
+        "range": range,
+        "total_crashes": len(crashes),
+        "by_error": error_counts,
+        "by_install": install_counts,
+        "crashes": crashes,
+    }
+
+
+@app.get("/api/events")
+def query_events(event: str, range: str = "7d", limit: int = 100):
+    """Query raw events by type. Use for debugging any event category."""
+    conn = get_db()
+    range_days = {"1d": 1, "7d": 7, "30d": 30, "all": 9999}.get(range, 7)
+    since = (datetime.utcnow() - timedelta(days=range_days)).isoformat()
+
+    rows = conn.execute(
+        "SELECT * FROM events WHERE event=? AND timestamp>=? ORDER BY timestamp DESC LIMIT ?",
+        (event, since, min(limit, 500))
+    ).fetchall()
+
+    events = []
+    for r in rows:
+        events.append({
+            "id": r["id"],
+            "event": r["event"],
+            "timestamp": r["timestamp"],
+            "install_id": r["install_id"],
+            "app_version": r["app_version"],
+            "received_at": r["received_at"],
+            "properties": json.loads(r["properties"]) if r["properties"] else {},
+        })
+
+    conn.close()
+    return {"event": event, "range": range, "count": len(events), "events": events}
+
+
+@app.get("/api/events/types")
+def event_types():
+    """List all distinct event types and their counts."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT event, COUNT(*) as cnt FROM events GROUP BY event ORDER BY cnt DESC"
+    ).fetchall()
+    conn.close()
+    return {"types": {r["event"]: r["cnt"] for r in rows}}
+
+
 @app.get("/api/dashboard")
 def dashboard(range: str = "7d"):
     """Return aggregated dashboard metrics as JSON.
