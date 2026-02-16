@@ -52,6 +52,33 @@ def init_db():
     conn.commit()
     conn.close()
 
+    # Crash reports table — stores rich diagnostics from MetricKit + signal handlers
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS crash_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            install_id TEXT NOT NULL,
+            app_version TEXT,
+            timestamp TEXT NOT NULL,
+            received_at TEXT DEFAULT (datetime('now')),
+            source TEXT DEFAULT 'unknown',
+            termination_reason TEXT,
+            exception_type TEXT,
+            signal TEXT,
+            error_message TEXT,
+            stack_trace TEXT,
+            hang_duration_ms REAL,
+            os_version TEXT,
+            mac_model TEXT,
+            memory_mb REAL,
+            properties TEXT DEFAULT '{}'
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_crash_install ON crash_reports(install_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_crash_timestamp ON crash_reports(timestamp)")
+
+    conn.commit()
+    conn.close()
+
 init_db()
 
 # --- Models ---
@@ -63,6 +90,22 @@ class AnalyticsEvent(BaseModel):
     app_version: Optional[str] = "unknown"
     install_id: Optional[str] = "unknown"
     synced: Optional[bool] = False
+
+class CrashReport(BaseModel):
+    install_id: str
+    app_version: Optional[str] = "unknown"
+    timestamp: str
+    source: str = "unknown"  # "metrickit", "signal_handler", "exception_handler", "clean_exit_check"
+    termination_reason: Optional[str] = None
+    exception_type: Optional[str] = None
+    signal: Optional[str] = None
+    error_message: Optional[str] = None
+    stack_trace: Optional[str] = None
+    hang_duration_ms: Optional[float] = None
+    os_version: Optional[str] = None
+    mac_model: Optional[str] = None
+    memory_mb: Optional[float] = None
+    properties: dict = {}
 
 # --- Auth ---
 
@@ -122,6 +165,111 @@ async def receive_single_event(request: Request):
         return {"received": 1}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/crash-report")
+async def receive_crash_report(request: Request):
+    """Receive a rich crash report with stack traces from MetricKit or signal handlers."""
+    body = await request.json()
+
+    # Accept single or batch
+    reports = body if isinstance(body, list) else [body]
+
+    conn = get_db()
+    inserted = 0
+    for raw in reports:
+        try:
+            cr = CrashReport(**raw)
+            conn.execute(
+                """INSERT INTO crash_reports
+                   (install_id, app_version, timestamp, source, termination_reason,
+                    exception_type, signal, error_message, stack_trace, hang_duration_ms,
+                    os_version, mac_model, memory_mb, properties)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (cr.install_id, cr.app_version, cr.timestamp, cr.source,
+                 cr.termination_reason, cr.exception_type, cr.signal,
+                 cr.error_message, cr.stack_trace, cr.hang_duration_ms,
+                 cr.os_version, cr.mac_model, cr.memory_mb,
+                 json.dumps(cr.properties))
+            )
+            inserted += 1
+        except Exception:
+            continue
+
+    conn.commit()
+    conn.close()
+    return {"received": inserted}
+
+
+@app.get("/api/crash-reports")
+def query_crash_reports(range: str = "7d", install_id: str = None, source: str = None):
+    """Query rich crash reports with stack traces and diagnostics."""
+    conn = get_db()
+    range_days = {"1d": 1, "7d": 7, "30d": 30, "all": 9999}.get(range, 7)
+    since = (datetime.utcnow() - timedelta(days=range_days)).isoformat()
+
+    query = "SELECT * FROM crash_reports WHERE timestamp>=?"
+    params = [since]
+    if install_id:
+        query += " AND install_id=?"
+        params.append(install_id)
+    if source:
+        query += " AND source=?"
+        params.append(source)
+    query += " ORDER BY timestamp DESC LIMIT 200"
+
+    rows = conn.execute(query, params).fetchall()
+
+    reports = []
+    by_source = {}
+    by_exception = {}
+    by_signal = {}
+    by_install = {}
+
+    for r in rows:
+        report = {
+            "id": r["id"],
+            "install_id": r["install_id"],
+            "app_version": r["app_version"],
+            "timestamp": r["timestamp"],
+            "received_at": r["received_at"],
+            "source": r["source"],
+            "termination_reason": r["termination_reason"],
+            "exception_type": r["exception_type"],
+            "signal": r["signal"],
+            "error_message": r["error_message"],
+            "stack_trace": r["stack_trace"],
+            "hang_duration_ms": r["hang_duration_ms"],
+            "os_version": r["os_version"],
+            "mac_model": r["mac_model"],
+            "memory_mb": r["memory_mb"],
+            "properties": json.loads(r["properties"]) if r["properties"] else {},
+        }
+        reports.append(report)
+
+        # Aggregations
+        src = r["source"] or "unknown"
+        by_source[src] = by_source.get(src, 0) + 1
+
+        exc = r["exception_type"] or "none"
+        by_exception[exc] = by_exception.get(exc, 0) + 1
+
+        sig = r["signal"] or "none"
+        by_signal[sig] = by_signal.get(sig, 0) + 1
+
+        iid = r["install_id"] or "unknown"
+        by_install[iid] = by_install.get(iid, 0) + 1
+
+    conn.close()
+    return {
+        "range": range,
+        "total": len(reports),
+        "by_source": dict(sorted(by_source.items(), key=lambda x: x[1], reverse=True)),
+        "by_exception_type": dict(sorted(by_exception.items(), key=lambda x: x[1], reverse=True)),
+        "by_signal": dict(sorted(by_signal.items(), key=lambda x: x[1], reverse=True)),
+        "by_install": by_install,
+        "reports": reports,
+    }
 
 
 @app.get("/api/tool-failures")
@@ -681,6 +829,19 @@ def dashboard(range: str = "7d"):
     tool_failures_count = count("tool_failed")
     applescript_errors_count = count("applescript_error")
 
+    # Rich crash reports (from MetricKit/signal handlers)
+    rich_crashes = conn.execute(
+        "SELECT COUNT(*) FROM crash_reports WHERE timestamp>=?", (since,)
+    ).fetchone()[0]
+    crash_with_traces = conn.execute(
+        "SELECT COUNT(*) FROM crash_reports WHERE timestamp>=? AND stack_trace IS NOT NULL AND stack_trace != ''",
+        (since,)
+    ).fetchone()[0]
+    hang_reports = conn.execute(
+        "SELECT COUNT(*) FROM crash_reports WHERE timestamp>=? AND hang_duration_ms IS NOT NULL",
+        (since,)
+    ).fetchone()[0]
+
     # Also count tool_used events (from new AnalyticsClient)
     tool_used_rows = conn.execute(
         "SELECT properties FROM events WHERE event='tool_used' AND timestamp>=?", (since,)
@@ -745,6 +906,9 @@ def dashboard(range: str = "7d"):
             "avg_llm_response_ms": avg_llm,
             "avg_rtai_response_ms": avg_rtai,
             "crash_count": crashes,
+            "rich_crash_reports": rich_crashes,
+            "crashes_with_stack_trace": crash_with_traces,
+            "hang_reports": hang_reports,
             "tool_failures": tool_failures_count,
             "applescript_errors": applescript_errors_count,
         },
