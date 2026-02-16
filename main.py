@@ -106,6 +106,175 @@ async def receive_events(request: Request):
     conn.close()
     return {"received": inserted}
 
+@app.post("/api/event")
+async def receive_single_event(request: Request):
+    """Receive a single analytics event from a Serena install (used by AnalyticsClient)."""
+    body = await request.json()
+    try:
+        ev = AnalyticsEvent(**body)
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO events (event, timestamp, properties, app_version, install_id) VALUES (?, ?, ?, ?, ?)",
+            (ev.event, ev.timestamp, json.dumps(ev.properties), ev.app_version, ev.install_id)
+        )
+        conn.commit()
+        conn.close()
+        return {"received": 1}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/tool-failures")
+def tool_failures(range: str = "7d", install_id: str = None):
+    """Return detailed tool failure events with full error context."""
+    conn = get_db()
+    range_days = {"1d": 1, "7d": 7, "30d": 30, "all": 9999}.get(range, 7)
+    since = (datetime.utcnow() - timedelta(days=range_days)).isoformat()
+
+    query = "SELECT * FROM events WHERE event='tool_failed' AND timestamp>=?"
+    params = [since]
+    if install_id:
+        query += " AND install_id=?"
+        params.append(install_id)
+    query += " ORDER BY timestamp DESC LIMIT 500"
+
+    rows = conn.execute(query, params).fetchall()
+
+    failures = []
+    tool_error_map = {}  # tool -> {error -> count}
+    for r in rows:
+        props = json.loads(r["properties"]) if r["properties"] else {}
+        tool = props.get("tool", "unknown")
+        error = props.get("error", "unknown")
+        failures.append({
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "install_id": r["install_id"],
+            "app_version": r["app_version"],
+            "tool": tool,
+            "action": props.get("action", "unknown"),
+            "error": error,
+            "error_code": props.get("error_code"),
+            "duration_ms": props.get("duration_ms", 0),
+            "params": props.get("params", {}),
+            "user_message": props.get("user_message"),
+            "stack_context": props.get("stack_context"),
+            "memory_mb": props.get("memory_mb"),
+            "recovery_attempted": props.get("recovery_attempted", False),
+        })
+        if tool not in tool_error_map:
+            tool_error_map[tool] = {}
+        tool_error_map[tool][error] = tool_error_map[tool].get(error, 0) + 1
+
+    conn.close()
+    return {
+        "range": range,
+        "total_failures": len(failures),
+        "by_tool": {t: dict(sorted(errs.items(), key=lambda x: x[1], reverse=True))
+                    for t, errs in sorted(tool_error_map.items(), key=lambda x: sum(x[1].values()), reverse=True)},
+        "failures": failures,
+    }
+
+
+@app.get("/api/applescript-errors")
+def applescript_errors(range: str = "7d"):
+    """Return AppleScript-specific errors with sandbox/permission diagnostics."""
+    conn = get_db()
+    range_days = {"1d": 1, "7d": 7, "30d": 30, "all": 9999}.get(range, 7)
+    since = (datetime.utcnow() - timedelta(days=range_days)).isoformat()
+
+    rows = conn.execute(
+        "SELECT * FROM events WHERE event='applescript_error' AND timestamp>=? ORDER BY timestamp DESC LIMIT 500",
+        (since,)
+    ).fetchall()
+
+    errors = []
+    app_error_map = {}  # target_app -> {error_message -> count}
+    for r in rows:
+        props = json.loads(r["properties"]) if r["properties"] else {}
+        target = props.get("target_app", "unknown")
+        msg = props.get("error_message", "unknown")
+        errors.append({
+            "id": r["id"],
+            "timestamp": r["timestamp"],
+            "install_id": r["install_id"],
+            "app_version": r["app_version"],
+            "target_app": target,
+            "script_action": props.get("script_action", "unknown"),
+            "error_message": msg,
+            "error_number": props.get("error_number"),
+            "automation_permission": props.get("automation_permission"),
+            "app_was_running": props.get("app_was_running"),
+            "sandbox_active": props.get("sandbox_active"),
+            "os_version": props.get("os_version"),
+            "device_model": props.get("device_model"),
+        })
+        if target not in app_error_map:
+            app_error_map[target] = {}
+        app_error_map[target][msg] = app_error_map[target].get(msg, 0) + 1
+
+    conn.close()
+    return {
+        "range": range,
+        "total_errors": len(errors),
+        "by_app": app_error_map,
+        "errors": errors,
+    }
+
+
+@app.get("/api/health-report")
+def health_report(range: str = "1d"):
+    """Comprehensive health report: errors, crashes, tool failures, performance — everything at a glance."""
+    conn = get_db()
+    range_days = {"1d": 1, "7d": 7, "30d": 30, "all": 9999}.get(range, 1)
+    since = (datetime.utcnow() - timedelta(days=range_days)).isoformat()
+
+    # Count each error-type event
+    error_events = ["crash_detected", "tool_failed", "applescript_error"]
+    counts = {}
+    for ev in error_events:
+        counts[ev] = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event=? AND timestamp>=?", (ev, since)
+        ).fetchone()[0]
+
+    # Recent errors (last 20 across all error types)
+    placeholders = ",".join(["?" for _ in error_events])
+    rows = conn.execute(
+        f"SELECT * FROM events WHERE event IN ({placeholders}) AND timestamp>=? ORDER BY timestamp DESC LIMIT 20",
+        (*error_events, since)
+    ).fetchall()
+
+    recent = []
+    for r in rows:
+        props = json.loads(r["properties"]) if r["properties"] else {}
+        recent.append({
+            "event": r["event"],
+            "timestamp": r["timestamp"],
+            "install_id": r["install_id"],
+            "error": props.get("error") or props.get("error_message", "unknown"),
+            "tool": props.get("tool") or props.get("target_app", ""),
+            "action": props.get("action") or props.get("script_action", ""),
+            "os_version": props.get("os_version", ""),
+            "device_model": props.get("device_model", ""),
+        })
+
+    # Affected installs
+    affected = conn.execute(
+        f"SELECT COUNT(DISTINCT install_id) FROM events WHERE event IN ({placeholders}) AND timestamp>=?",
+        (*error_events, since)
+    ).fetchone()[0]
+
+    conn.close()
+    return {
+        "range": range,
+        "since": since,
+        "error_counts": counts,
+        "total_errors": sum(counts.values()),
+        "affected_installs": affected,
+        "recent_errors": recent,
+    }
+
+
 @app.get("/api/crashes")
 def crashes(range: str = "all", install_id: str = None):
     """Return detailed crash events with full properties."""
@@ -325,8 +494,22 @@ def dashboard(range: str = "7d"):
     tca_engaged = count("tca_engaged")
     tca_rate = round(tca_engaged / tca_triggered, 3) if tca_triggered > 0 else 0
 
-    # --- Crashes ---
+    # --- Crashes & Errors ---
     crashes = count("crash_detected")
+    tool_failures_count = count("tool_failed")
+    applescript_errors_count = count("applescript_error")
+
+    # Also count tool_used events (from new AnalyticsClient)
+    tool_used_rows = conn.execute(
+        "SELECT properties FROM events WHERE event='tool_used' AND timestamp>=?", (since,)
+    ).fetchall()
+    for r in tool_used_rows:
+        try:
+            tool = json.loads(r["properties"]).get("tool", "unknown")
+            tool_usage[tool] = tool_usage.get(tool, 0) + 1
+        except Exception:
+            pass
+    tool_usage = dict(sorted(tool_usage.items(), key=lambda x: x[1], reverse=True))
 
     # --- Active Trials ---
     active_trials = max(0, conn.execute(
@@ -380,6 +563,8 @@ def dashboard(range: str = "7d"):
             "avg_llm_response_ms": avg_llm,
             "avg_rtai_response_ms": avg_rtai,
             "crash_count": crashes,
+            "tool_failures": tool_failures_count,
+            "applescript_errors": applescript_errors_count,
         },
         "tca": {
             "triggered": tca_triggered,
@@ -457,6 +642,8 @@ def dashboard_html(range: str = "7d"):
   <div class="card"><div class="label">Free Limit Hits</div><div class="value">{e['free_limit_hits']}</div></div>
   <div class="card"><div class="label">Avg LLM Response</div><div class="value">{perf['avg_llm_response_ms']:.0f}ms</div></div>
   <div class="card"><div class="label">Crashes</div><div class="value">{perf['crash_count']}</div></div>
+  <div class="card"><div class="label">Tool Failures</div><div class="value">{perf['tool_failures']}</div></div>
+  <div class="card"><div class="label">AppleScript Errors</div><div class="value">{perf['applescript_errors']}</div></div>
 </div>
 
 <div class="section"><h2>Tool Usage ({t['total_calls']} total)</h2>
