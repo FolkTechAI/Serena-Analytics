@@ -752,11 +752,19 @@ def dashboard(range: str = "7d"):
 
     sub_started = count("subscription_started")
     sub_cancelled = count("subscription_cancelled")
-    active_subs = max(0, conn.execute(
-        "SELECT COUNT(DISTINCT install_id) FROM events WHERE event='subscription_started'"
-    ).fetchone()[0] - conn.execute(
-        "SELECT COUNT(DISTINCT install_id) FROM events WHERE event='subscription_cancelled'"
-    ).fetchone()[0])
+    # Active subs: count installs whose most recent subscription event is a start or renew
+    active_subs = conn.execute("""
+        SELECT COUNT(*) FROM (
+            SELECT install_id,
+                   (SELECT event FROM events e2
+                    WHERE e2.install_id = e1.install_id
+                    AND e2.event IN ('subscription_started','subscription_cancelled','subscription_renewed','subscription_expired')
+                    ORDER BY e2.timestamp DESC LIMIT 1) as latest_event
+            FROM events e1
+            WHERE e1.event IN ('subscription_started','subscription_cancelled','subscription_renewed','subscription_expired')
+            GROUP BY e1.install_id
+        ) WHERE latest_event IN ('subscription_started','subscription_renewed')
+    """).fetchone()[0]
     mrr = active_subs * 20.0
     churn_rate = round(sub_cancelled / sub_started, 3) if sub_started > 0 else 0
 
